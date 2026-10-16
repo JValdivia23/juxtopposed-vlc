@@ -1,13 +1,12 @@
 # Building this fork on Linux (Meson)
 
-> Status on CachyOS: `meson setup` verified
-> (`--buildtype=debugoptimized --wrap-mode=nofallback
-> -Dqt=enabled -Dmedialibrary=disabled -Dtests=auto`:
-> 800 targets, 164 tests registered, 42 Qt registrations with
-> both media-library tests correctly omitted). Full build,
-> runtime, tests, and install are still pending. There is no
-> installable Linux release; Linux users build the native VLC
-> 4.0.0-dev tree from source. The Windows beta builds on the
+> Status on CachyOS: configure, full default build,
+> headless playback, native Wayland playback, and a staged
+> install are validated (see "Validation" below). The Qt
+> suite stands at 41 pass / 1 fail with one explicit
+> remaining failure; no live installation has been
+> performed. There is no installable Linux release; Linux
+> users build the native VLC 4.0.0-dev tree from source. The Windows beta builds on the
 > [Releases page](https://github.com/dsojevic/juxtopposed-vlc/releases)
 > ship with the media library; the baseline below disables it,
 > so expect that feature difference.
@@ -30,7 +29,7 @@ sudo pacman -S --needed base-devel git meson ninja cmake pkgconf python \
     qt6-base qt6-declarative qt6-svg qt6-shadertools qt6-wayland \
     ffmpeg alsa-lib libpulse pipewire wayland wayland-protocols \
     libxkbcommon xcb-util-keysyms mesa lua gnutls libgcrypt \
-    libxml2 sqlite libpng zvbi
+    libxml2 sqlite libpng zvbi vulkan-headers
 ```
 
 This list is a starting point, not a tested minimal
@@ -46,6 +45,13 @@ fresh-machine closure. Option handling falls into two kinds:
 
 Further notes:
 
+- `vulkan-headers` is required, not just the loader.
+  `vulkan-icd-loader` ships `vulkan.pc`, so configure
+  detects Vulkan and enables the `placebo_vk` module — but
+  compiling it needs `vulkan/vulkan.h` from the separate
+  `vulkan-headers` package (first build attempt stopped at
+  `video_output/vulkan/platform.c` without it). Alternative:
+  `-Dvulkan=disabled` (`feature`, default `auto`).
 - `nasm` is optional (`required: false` in `meson.build`);
   without it you lose x86 assembly acceleration paths but
   the build succeeds.
@@ -124,49 +130,80 @@ env XDG_CONFIG_HOME="$test_root/config" \
 (`fish` users: `set test_root (mktemp -d)` for the first
 line; the `env`-prefixed invocations are unchanged.) Use the
 same XDG wrapping for every later run, replacing
-`--version` with your actual arguments.
+`--version` with your actual arguments. The build-tree
+`--version` exits 0 and reports VLC 4.0.0-dev.
+
+A reproducible headless playback check (validated flags;
+generate the sample with `ffmpeg`, e.g. a couple of seconds
+of FFV1 video plus PCM audio in Matroska):
+
+```sh
+env XDG_CONFIG_HOME="$test_root/config" \
+    XDG_DATA_HOME="$test_root/data" \
+    XDG_CACHE_HOME="$test_root/cache" \
+    ./build-linux/bin/vlc-static --ignore-config --no-media-library \
+        --no-metadata-network-access --intf=dummy --vout=dummy \
+        --aout=dummy --play-and-exit -vv sample.mkv
+```
+
+This exits 0 with the avcodec video decoder and the araw
+audio decoder engaged through end-of-stream. No provider
+streams have been tested.
 
 Do not set `VLC_PLUGIN_PATH` to the system VLC 3.x plugin
 directory: this is a VLC 4 (`libvlc` ABI 12.0.0) build and
 must only load its own build-tree plugins. Close other VLC
 instances before testing.
 
-## Optional: install to a user prefix (documented, unverified)
+## Optional: install to a user prefix (staged only, live install unperformed)
 
 The build definitions do install (per-target `install: true`
-with user-prefix-relative destinations), but no install has
-been run or measured yet, and the tree sets no RPATH and
-ships no install hooks. In particular, a plain `meson
-install` followed by `<prefix>/bin/vlc` is not expected to
-just work: the system loader does not search your prefix
-library directory, so `libvlc.so.12` and `libvlccore.so.9`
-will not resolve. Until a staged install is validated,
-prefer the build-tree `vlc-static` runner above.
+with user-prefix-relative destinations), and a staged
+install into a scratch `DESTDIR` has been measured to
+succeed: the installation payload was staged under
+`DESTDIR` while the live prefix remained absent. (Meson
+updates its normal build-directory install logs, and no
+strace audit was done, so this is not a claim of zero
+filesystem writes anywhere else.) Live prefix installation
+was not part of validation; the tested paths are the
+build-tree `vlc-static` runner above and the staged runner
+below.
 
-Once an install exists, find your actual library directory
-first — do not assume `lib` vs `lib64` or multi-arch
-triplets:
+Measured staged-install facts (source reasoning confirmed,
+not just predicted): the tree sets no RPATH/RUNPATH and
+ships no install hooks — staged `bin/vlc` lists
+`libvlc.so.12` / `libvlccore.so.9` as NEEDED with no
+RPATH/RUNPATH, and runs without `LD_LIBRARY_PATH` fail
+with missing `libvlc.so.12`. Launch per-process (never a
+global export, never `ld.so.conf` changes) with both the
+prefix library directory and its `vlc` subdirectory,
+conservatively — the Qt plugins resolve with the first
+path alone, with no claim about which specific libraries
+require the second:
+
+```sh
+env LD_LIBRARY_PATH="<prefix>/<libdir>:<prefix>/<libdir>/vlc" \
+    XDG_CONFIG_HOME="$test_root/config" \
+    XDG_DATA_HOME="$test_root/data" \
+    XDG_CACHE_HOME="$test_root/cache" \
+    "<prefix>/bin/vlc" --version
+```
+
+Find your actual libdir first — do not assume `lib` vs
+`lib64` or multi-arch triplets:
 
 ```sh
 meson configure build-linux | grep -E '^[[:space:]]*(libdir|prefix)[[:space:]]'
 ```
 
-then launch per-process (never a global export, never
-`ld.so.conf` changes) with full XDG isolation:
-
-```sh
-env LD_LIBRARY_PATH="$HOME/.local/vlc-dev/lib" \
-    XDG_CONFIG_HOME="$test_root/config" \
-    XDG_DATA_HOME="$test_root/data" \
-    XDG_CACHE_HOME="$test_root/cache" \
-    "$HOME/.local/vlc-dev/bin/vlc" --version
-```
-
-(substitute the real libdir from the configure output for
-`lib` above). A non-destructive staged check the install
-itself writes only where told is `meson install -C build-linux
---no-rebuild --destdir <scratch-dir>`; validation of that
-is still pending.
+With those two loader paths, staged `--version` exits 0,
+the same synthetic headless playback exits 0, and all five
+staged Qt plugins show no missing dependencies under
+`ldd` (`lib`-only also covered the Qt plugins, but other
+outputs may need `lib/vlc`, so both paths are given
+conservatively). The non-destructive staged form used was
+`meson install -C build-linux --no-rebuild --destdir
+<scratch-dir> --quiet`.
 
 ## Wayland notes
 
@@ -176,8 +213,11 @@ video embedding when Wayland integration is unavailable, and
 the `libvlccore` export the Qt plugin links against).
 Do not carry the old standalone patches by default.
 
-If video still opens in a separate window on Wayland, the
-optional fallback is the XCB platform with in-window video
+Native Wayland playback is validated (see "Validation"):
+the Qt interface opens its own Wayland window (not
+XWayland) and plays video to end-of-stream. If video still
+opens in a separate window on your compositor, the optional
+fallback is the XCB platform with in-window video
 (`embedded-video` defaults to true), still under XDG
 isolation:
 
@@ -224,5 +264,43 @@ env QT_QPA_PLATFORM=offscreen \
     meson test -C build-linux --no-rebuild --suite VLC:qt --num-processes 2
 ```
 
-No pass/fail counts are claimed here; report whatever this
-tree actually produces.
+## Validation
+
+Environment: CachyOS x86_64 (Hyprland), Qt 6.12.0,
+GCC 16.2.1, Meson 1.12.1. Configure flags:
+`--buildtype=debugoptimized --wrap-mode=nofallback
+-Dqt=enabled -Dmedialibrary=disabled -Dtests=auto`
+(800 targets, 164 tests registered, 42 Qt registrations,
+both media-library tests correctly omitted).
+
+| Check | Result |
+| --- | --- |
+| Full default build | Pass |
+| Build-tree `--version` | Exit 0, VLC 4.0.0-dev |
+| Headless playback (2 s FFV1 + PCM Matroska sample, dummy intf/vout/aout, `--play-and-exit`) | Exit 0, avcodec + araw decoders to end-of-stream |
+| Same sample from staged install (per-process `LD_LIBRARY_PATH`) | Exit 0 |
+| Staged `meson install --destdir` | Succeeds, payload staged under `DESTDIR` with live prefix absent; staged `bin/vlc` has no RPATH/RUNPATH and needs the loader paths |
+| Native Wayland Qt playback (`--intf=qt`, dummy audio, silent 8 s FFV1 clip, `--play-and-exit`) | Exit 0, own Wayland window (not XWayland), `qt_wayland` + `egl_wl` in logs, end-of-stream |
+| Qt suite (`VLC:qt`, 42) | 41 pass / 1 fail (see below) |
+
+The GUI check used a first-run flag plus throwaway state,
+e.g. `--no-qt-privacy-ask` with isolated XDG directories.
+Silent video only: not an HDR, hardware-decode, or real
+audio-hardware test, and no provider streams or media
+library were exercised. The headless check likewise tests
+decoding, not PipeWire or speaker output.
+
+Remaining failure: `tst_RedesignLibrary ::
+JuxtopposedLibrary :: test_breadcrumbsKeepHiddenAncestorsAvailable`
+(`tst_RedesignLibrary.qml:426`, `menu.opened` false instead
+of true); 51 other cases in that file pass, and the failure
+reproduces in a sequential rerun with fresh isolated state.
+Production and test QML sources are unmodified by this
+work. Root cause is not confirmed, so no claim is made
+about flakiness, environment, or production code — the
+failure is recorded as-is and the assertion is left
+untouched. A Meson test-registration fix for the subtitle
+scanner test (plugin path plus module dependencies) is
+included in this contribution; no production UI or codec
+code is changed, and the baseline is therefore not fully
+green.
